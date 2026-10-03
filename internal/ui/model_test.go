@@ -477,6 +477,54 @@ func TestMessageSending(t *testing.T) {
 	}
 }
 
+func TestMessageSending_InvokesCallback(t *testing.T) {
+	var sentRecipient string
+	var sentContent string
+
+	m := NewModel("alice", "SHA256:test")
+	m.Peers = []Peer{
+		{Nick: "bob", Fingerprint: "SHA256:bbb", Status: "online"},
+	}
+	m.ActivePeer = &m.Peers[0]
+	m.Focus = FocusInput
+	m.Input.SetValue("Hello Bob via callback")
+	m.SendMessage = func(recipientFP, content string) error {
+		sentRecipient = recipientFP
+		sentContent = content
+		return nil
+	}
+
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_ = newM.(Model)
+
+	if sentRecipient != "SHA256:bbb" {
+		t.Errorf("expected recipient 'SHA256:bbb', got %q", sentRecipient)
+	}
+	if sentContent != "Hello Bob via callback" {
+		t.Errorf("expected content 'Hello Bob via callback', got %q", sentContent)
+	}
+}
+
+func TestSlashCommand_Nick_InvokesCallback(t *testing.T) {
+	var reportedOld, reportedNew string
+
+	m := NewModel("alice", "SHA256:test")
+	m.Focus = FocusInput
+	m.Input.SetValue("/nick alicia")
+	m.ChangeNick = func(oldNick, newNick string) error {
+		reportedOld = oldNick
+		reportedNew = newNick
+		return nil
+	}
+
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_ = newM.(Model)
+
+	if reportedOld != "alice" || reportedNew != "alicia" {
+		t.Errorf("expected old='alice', new='alicia', got old=%q, new=%q", reportedOld, reportedNew)
+	}
+}
+
 func TestExternalMessages(t *testing.T) {
 	m := NewModel("alice", "SHA256:alice")
 

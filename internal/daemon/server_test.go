@@ -500,3 +500,139 @@ func TestServer_SSHClientIntegration(t *testing.T) {
 	}
 }
 
+func TestServer_MultiSessionRosterSync(t *testing.T) {
+	srv, err := daemon.NewServer(daemon.Config{
+		Host: "127.0.0.1",
+		Port: 0,
+	})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Close()
+
+	addr := srv.Addr().String()
+
+	// Alice client
+	_, alicePriv, _ := ed25519.GenerateKey(rand.Reader)
+	aliceSigner, _ := ssh.NewSignerFromKey(alicePriv)
+	aliceConfig := &ssh.ClientConfig{
+		User:            "alice",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(aliceSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         2 * time.Second,
+	}
+
+	aliceConn, err := ssh.Dial("tcp", addr, aliceConfig)
+	if err != nil {
+		t.Fatalf("failed to connect Alice: %v", err)
+	}
+	defer aliceConn.Close()
+
+	aliceSession, err := aliceConn.NewSession()
+	if err != nil {
+		t.Fatalf("failed to open Alice session: %v", err)
+	}
+	defer aliceSession.Close()
+
+	modes := ssh.TerminalModes{ssh.ECHO: 0}
+	_ = aliceSession.RequestPty("xterm", 80, 24, modes)
+	_ = aliceSession.Shell()
+
+	// Wait for Alice session to register
+	aliceFP := peer.FingerprintKey(aliceSigner.PublicKey())
+	for i := 0; i < 50; i++ {
+		if srv.ActiveSessions() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveSessions() != 1 {
+		t.Fatalf("expected 1 active session for Alice, got %d", srv.ActiveSessions())
+	}
+
+	// Bob client
+	_, bobPriv, _ := ed25519.GenerateKey(rand.Reader)
+	bobSigner, _ := ssh.NewSignerFromKey(bobPriv)
+	bobConfig := &ssh.ClientConfig{
+		User:            "bob",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(bobSigner)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         2 * time.Second,
+	}
+
+	bobConn, err := ssh.Dial("tcp", addr, bobConfig)
+	if err != nil {
+		t.Fatalf("failed to connect Bob: %v", err)
+	}
+	defer bobConn.Close()
+
+	bobSession, err := bobConn.NewSession()
+	if err != nil {
+		t.Fatalf("failed to open Bob session: %v", err)
+	}
+	defer bobSession.Close()
+
+	_ = bobSession.RequestPty("xterm", 80, 24, modes)
+	_ = bobSession.Shell()
+
+	// Wait for Bob session to register
+	bobFP := peer.FingerprintKey(bobSigner.PublicKey())
+	for i := 0; i < 50; i++ {
+		if srv.ActiveSessions() == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveSessions() != 2 {
+		t.Fatalf("expected 2 active sessions for Alice & Bob, got %d", srv.ActiveSessions())
+	}
+
+	// Verify both peers in Registry
+	if _, ok := srv.Registry().Get(aliceFP); !ok {
+		t.Errorf("Alice missing from registry")
+	}
+	if _, ok := srv.Registry().Get(bobFP); !ok {
+		t.Errorf("Bob missing from registry")
+	}
+
+	// Test SendTo and Broadcast
+	sent := srv.SendTo(aliceFP, "test message")
+	if !sent {
+		t.Errorf("expected SendTo aliceFP to return true")
+	}
+	srv.Broadcast("broadcast message")
+
+	// Disconnect Bob and verify session count drops to 1
+	_ = bobSession.Close()
+	_ = bobConn.Close()
+
+	for i := 0; i < 50; i++ {
+		if srv.ActiveSessions() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveSessions() != 1 {
+		t.Errorf("expected 1 active session after Bob left, got %d", srv.ActiveSessions())
+	}
+
+	// Disconnect Alice and verify session count drops to 0
+	_ = aliceSession.Close()
+	_ = aliceConn.Close()
+
+	for i := 0; i < 50; i++ {
+		if srv.ActiveSessions() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.ActiveSessions() != 0 {
+		t.Errorf("expected 0 active sessions after Alice left, got %d", srv.ActiveSessions())
+	}
+}
+
+

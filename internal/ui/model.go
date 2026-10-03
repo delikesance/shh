@@ -67,6 +67,9 @@ type Model struct {
 	RosterWidth    int
 	ViewportWidth  int
 	ViewportHeight int
+
+	SendMessage func(recipientFP string, content string) error
+	ChangeNick  func(oldNick string, newNick string) error
 }
 
 // NewModel constructs and initializes a new UI model with defaults.
@@ -314,6 +317,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				})
 				m.refreshViewportContent()
 				m.Viewport.GotoBottom()
+				if m.SendMessage != nil {
+					_ = m.SendMessage(m.ActivePeer.Fingerprint, text)
+				}
 				return m, nil
 			}
 		}
@@ -434,6 +440,9 @@ func (m Model) handleCommand(cmd Command, args []string, rawInput string) (tea.M
 				m.Peers[i].Nick = newNick
 				break
 			}
+		}
+		if m.ChangeNick != nil {
+			_ = m.ChangeNick(oldNick, newNick)
 		}
 		m.addSystemMessage(fmt.Sprintf("Nickname changed from %s to %s", oldNick, newNick))
 		return m, nil

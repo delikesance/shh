@@ -16,6 +16,7 @@ import (
 	csh "github.com/charmbracelet/ssh"
 	"github.com/charmbracelet/wish"
 	bmw "github.com/charmbracelet/wish/bubbletea"
+	"github.com/muesli/termenv"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -56,6 +57,9 @@ type Server struct {
 	done       chan struct{}
 	started    bool
 	mu         sync.Mutex
+
+	sessionsMu sync.RWMutex
+	sessions   map[string]*tea.Program
 }
 
 // NewServer configures and initializes a new daemon Server.
@@ -95,6 +99,7 @@ func NewServer(cfg Config) (*Server, error) {
 	srv := &Server{
 		cfg:      cfg,
 		registry: cfg.Registry,
+		sessions: make(map[string]*tea.Program),
 	}
 
 	// Host key option to inject pre-configured signer into wish server
@@ -103,8 +108,8 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil
 	}
 
-	// Bubble Tea handler creating a new UI model per SSH session
-	teaHandler := func(sess csh.Session) (tea.Model, []tea.ProgramOption) {
+	// Program handler creating a new tea.Program per session with live roster and routing
+	programHandler := func(sess csh.Session) *tea.Program {
 		p, _ := sess.Context().Value(ContextKeyPeer).(*peer.Peer)
 		handle := "anonymous"
 		fp := ""
@@ -115,8 +120,67 @@ func NewServer(cfg Config) (*Server, error) {
 			fp = peer.FingerprintKey(sess.PublicKey())
 			handle = sess.User()
 		}
+
+		// Initial roster from currently registered peers
+		var initialPeers []ui.Peer
+		initialPeers = append(initialPeers, ui.Peer{
+			Nick:        handle,
+			Fingerprint: fp,
+			Status:      "online",
+			IsSelf:      true,
+		})
+		for _, regPeer := range srv.registry.List() {
+			if regPeer.Fingerprint() != fp {
+				initialPeers = append(initialPeers, ui.Peer{
+					Nick:        regPeer.Handle(),
+					Fingerprint: regPeer.Fingerprint(),
+					Status:      "online",
+					IsSelf:      false,
+				})
+			}
+		}
+
 		m := ui.NewModel(handle, fp)
-		return m, []tea.ProgramOption{tea.WithAltScreen()}
+		m.Peers = initialPeers
+
+		// Outbound message sending callback
+		m.SendMessage = func(recipientFP, content string) error {
+			srv.SendTo(recipientFP, ui.ReceiveMessageMsg{
+				Sender:    handle,
+				Content:   content,
+				Timestamp: time.Now(),
+				IsSystem:  false,
+			})
+			return nil
+		}
+
+		// Outbound nick change callback
+		m.ChangeNick = func(oldNick, newNick string) error {
+			if p != nil {
+				_ = p.SetHandle(newNick)
+			}
+			srv.Broadcast(ui.NickChangedMsg{
+				OldNick: oldNick,
+				NewNick: newNick,
+			}, fp)
+			return nil
+		}
+
+		prog := tea.NewProgram(m, append([]tea.ProgramOption{tea.WithAltScreen()}, bmw.MakeOptions(sess)...)...)
+
+		srv.sessionsMu.Lock()
+		srv.sessions[fp] = prog
+		srv.sessionsMu.Unlock()
+
+		// Broadcast peer joined to all other active sessions
+		srv.Broadcast(ui.PeerJoinedMsg{
+			Nick:        handle,
+			Fingerprint: fp,
+			Status:      "online",
+			IsSelf:      false,
+		}, fp)
+
+		return prog
 	}
 
 	// Session middleware: handles peer registry registration and teardown lifecycle
@@ -132,6 +196,10 @@ func NewServer(cfg Config) (*Server, error) {
 				}
 				defer func() {
 					_ = srv.registry.Unregister(p.Fingerprint())
+					srv.sessionsMu.Lock()
+					delete(srv.sessions, p.Fingerprint())
+					srv.sessionsMu.Unlock()
+					srv.Broadcast(ui.PeerLeftMsg(p.Fingerprint()))
 				}()
 			}
 			next(sess)
@@ -143,7 +211,7 @@ func NewServer(cfg Config) (*Server, error) {
 		withSignerOption,
 		wish.WithPublicKeyAuth(srv.PublicKeyHandler),
 		wish.WithMiddleware(
-			bmw.Middleware(teaHandler),
+			bmw.MiddlewareWithProgramHandler(programHandler, termenv.Ascii),
 			sessionMiddleware,
 		),
 	}
@@ -337,4 +405,37 @@ func (s *Server) Close() error {
 		<-done
 	}
 	return err
+}
+
+// ActiveSessions returns the number of active connected sessions.
+func (s *Server) ActiveSessions() int {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	return len(s.sessions)
+}
+
+// Broadcast sends a message to all active Bubble Tea sessions, optionally excluding a peer by fingerprint.
+func (s *Server) Broadcast(msg tea.Msg, exceptFP ...string) {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	for fp, prog := range s.sessions {
+		if len(exceptFP) > 0 && fp == exceptFP[0] {
+			continue
+		}
+		if prog != nil {
+			prog.Send(msg)
+		}
+	}
+}
+
+// SendTo sends a message to a specific peer's session identified by fingerprint.
+func (s *Server) SendTo(fp string, msg tea.Msg) bool {
+	s.sessionsMu.RLock()
+	defer s.sessionsMu.RUnlock()
+	prog, ok := s.sessions[fp]
+	if ok && prog != nil {
+		prog.Send(msg)
+		return true
+	}
+	return false
 }
