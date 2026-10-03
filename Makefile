@@ -1,3 +1,5 @@
+export GOPATH := $(HOME)/go
+
 BINARY_NAME=shh
 BUILD_DIR=bin
 
@@ -7,13 +9,13 @@ all: build
 
 build:
 	@mkdir -p $(BUILD_DIR)
-	go build -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/shh
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/shh
 
 run:
 	go run ./cmd/shh -p 2222
 
 test:
-	go test -v ./...
+	go test -v -race ./...
 
 clean:
 	rm -rf $(BUILD_DIR)
